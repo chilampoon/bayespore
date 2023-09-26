@@ -20,16 +20,16 @@ def modification_model(data, cov, alpha, beta, n_mod_status=2):
     is_observed = (~torch.isnan(data))
     valid_mat = torch.nan_to_num(data, nan=0.0)
 
-    # modification plate:
+    # modification params:
     with pyro.plate("mod_k", n_mod_status, dim=-1):
-        ρ_k = pyro.sample(
-            "ρ_k",
-            dist.Gamma(1/n_mod_status, 1)
-        )
-
         μ_kt = pyro.sample(
-            "μ_kt",
+            "μ_kt", 
             dist.MultivariateNormal(torch.zeros(n_datapoints), cov)
+        )
+        # weight for modified/unmodified
+        ω = pyro.sample(
+            "ω",
+            dist.Gamma(1/n_mod_status, 1)
         )
     
     # noise:
@@ -38,26 +38,23 @@ def modification_model(data, cov, alpha, beta, n_mod_status=2):
         dist.InverseGamma(alpha, beta) # concentration, rate
     )
 
-    # read plate:
+    # read params:
     with pyro.plate("read_i", n_reads, dim=-1):
-        m = pyro.sample(
-            "m", 
-            dist.Categorical(ρ_k)
-        )
+        m = pyro.sample("m_i", dist.Categorical(ω))
         
         y_it = pyro.sample(
             "y_it",
             dist.Normal(μ_kt[m, :], τ_2).mask(is_observed).to_event(1),
             obs=valid_mat
         )
-#pyro.render_model(modification_model, model_args=(data, kmer_cov, 1, 1), 
-#                  render_distributions=True, render_params=True)            
+# pyro.render_model(modification_model, model_args=(data, kmer_cov, 1, 1), 
+#                   render_distributions=True, render_params=True)                    
 
 def kmer_cov_matrix(k, n_datapoints_per_base, variance, lengthscale):
     # Coregionalized GPs
     base_cov = create_cov_matrix(n_datapoints_per_base, variance, lengthscale) 
-    base_corr = torch.eye(k)
-    kmer_cov = torch.kron(base_cov, base_corr)
+    inter_bases_corr = torch.eye(k)
+    kmer_cov = torch.kron(base_cov, inter_bases_corr)
     return kmer_cov
 
 def create_cov_matrix(input_dim, variance, lengthscale):
@@ -106,7 +103,7 @@ def m_i_posterior(data, mu, tau_2, rho):
     posterior_prob_for_m = np.exp(log_posterior - logsumexp(log_posterior, axis=0))
     return posterior_prob_for_m
 
-def mu_per_base(mu, mod_status, n_datapoints):
-    mu_reshaped = mu.reshape(mod_status, -1, n_datapoints)
+def mu_per_base(mu, n_mod_status, n_datapoints):
+    mu_reshaped = mu.reshape(n_mod_status, -1, n_datapoints)
     mean_base = np.mean(mu_reshaped, axis=-1)
     return mean_base
