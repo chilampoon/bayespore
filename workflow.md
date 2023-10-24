@@ -19,7 +19,7 @@ dorado basecaller ~/dorado_model/rna002_70bps_hac\@v3/ ./pod5 -x cuda:all --emit
 ```
 
 ## Alignment:
-Here use `map-ont` for ivt because reads are unsplicded. For real bio data, should use the splice option.
+Here use `map-ont` for ivt because reads are unspliced. For real bio data, should use the splice option `splice -uf`.
 
 `-T*` and `-y` are to pass all tags from basecall bam to fastq then to minimap2. `--MD` is needed.
 ```

@@ -7,6 +7,11 @@ from collections import defaultdict
 
 ## WIP
 
+SIG_MIN = -10
+SIG_MAX = 10
+MIN_DPS = 5
+
+
 def process_inputs(bam_file,
         pod5_file,
         level_table,
@@ -31,72 +36,126 @@ def process_inputs(bam_file,
         end=1218
     )
 
-    read_sigs_in_win = extract_window_signals(bam_fh, pod5_fh, ref_reg, 
-                    window_size, sig_map_refiner,
-                    min_win_datapoints, reverse_signal)
+    bam_reads_reg = io.get_reg_bam_reads(ref_reg, bam_fh)
+    io_reads = io.get_io_reads(bam_reads_reg, pod5_fh, reverse_signal=True)
+
+    seq, levels = io.get_ref_seq_and_levels_from_reads(
+        ref_reg, bam_reads_reg, sig_map_refiner
+    )
+
+
     return read_sigs_in_win
 
-def extract_window_signals(bam, pod5, ref_reg, window_size, sig_map_refiner,
-                           min_win_datapoints, reverse_signal):
-    '''
-    Extract normalized signals from bam and pod5 files.
-        - bam (pysam.AlignmentFile): bam file
-        - pod5 (pod5.Reader): pod5 file
-    Returns: a list of ReadRefReg objects
-    '''
-    window_list = [(i,i+window_size) for i in range(ref_reg.start, ref_reg.end, window_size)]
-    read_sigs_in_win = defaultdict(lambda: defaultdict(np.array)) #{win:{read:sig}}
+def get_metrics(io_reads):
+    # extract per base metrics
+    read_to_metrics = {}
+    base_to_reads = defaultdict(list)
 
-    bam_reads_reg = io.get_reg_bam_reads(ref_reg, bam)
-    io_reads = io.get_io_reads(bam_reads_reg, pod5, reverse_signal)
     for io_read in io_reads:
         # only reference anchored now
-        io_read.set_refine_signal_mapping(sig_map_refiner, ref_mapping=True)
+        try:
+            io_read.set_refine_signal_mapping(sig_map_refiner, ref_mapping=True)
+        except Exception:
+            continue
         read = io_read.extract_ref_reg(ref_reg)
+        compute_per_base_metrics(read, read_to_metrics, base_to_reads, min_dps=MIN_DPS)
+    return read_to_metrics, base_to_reads
 
-        coords = read.ref_sig_coords
-        sig = read.norm_signal
-        read_id = read.read_id
-        for s, e in window_list:
-            if s > read.ref_reg.end:
-                break
-            mask = (coords >= s) & (coords <= e)
-            filtered_coords = coords[mask]
-            if len(filtered_coords) >= min_win_datapoints:
-                read_sigs_in_win[(s, e)][read_id] = sig[mask]
-    return read_sigs_in_win
-
-def make_signal_input(window, read_sigs_in_win):
-    '''Generate input matrix where signals from each base 
-       have the same number of datapoints
+def compute_per_base_metrics(
+        read, 
+        read_to_metrics, 
+        base_to_reads, 
+        min_dps=5
+    ):
     '''
-    # get lengths of signals in each bases
-    sig_data_diff_len = []
-    reads_in_window = []
-    base_num_values = defaultdict(list)
-    read_sigs = read_sigs_in_win[window]
-    for read, base_sigs in read_sigs.items():
-        reads_in_window.append(read)
-        [base_num_values[i].append(len(b)) for i, b in enumerate(base_sigs)]
-        base_sigs = [torch.tensor(s, dtype=torch.float32) for s in base_sigs]
-        sig_data_diff_len.append(base_sigs)
-    
-    # simply calculate median and add paddings or subsample
-    median_dps = [np.ceil(np.median(dps)) for dps in base_num_values.values()]
-    len_dps = int(max(median_dps))
+    return ref coordinate (0-base), mean, sd, dwell for each base
+    ndarray with shape (4, n_ref_bases)
+    '''
+    ref_to_sig = read.ref_sig_coords
+    sig = read.norm_signal
+    coords_int = np.unique(np.floor(ref_to_sig)).astype(int)
+    means = []; sds = []; dwells = []
+    pass_bases = []
+    for b in coords_int:
+        mask = (ref_to_sig >= b) & (ref_to_sig <= b+1)
+        base_sig = sig[mask]
+        base_sig = base_sig[(base_sig <= SIG_MAX) & (base_sig >= SIG_MIN)]
+        if len(base_sig) >= min_dps:
+            pass_bases.append(True)
+            base_to_reads[b].append(read.read_id)
+            
+            means.append(np.mean(base_sig))
+            sds.append(np.std(base_sig))
+            dwells.append(len(base_sig))
+        else:
+            pass_bases.append(False)
+    read_info = np.vstack([coords_int[pass_bases], means, sds, dwells])
+    read_to_metrics[read.read_id] = read_info
 
-    sig_data_same_len = []
-    for base_sigs in sig_data_diff_len:
-        sigs = []
-        for base_sig in base_sigs:
-            if len(base_sig) <= len_dps:
-                # padding
-                base_sig = torch.cat([base_sig, torch.full((len_dps - len(base_sig),), float('nan'))])
+MET_IDX_MAP = {
+    'ref': 0,
+    'mean': 1,
+    'sd': 2,
+    'dwell': 3
+}
+
+def get_mat_wo_nan(reg, read_to_metrics, base_to_reads, metric='mean'):
+    '''
+    fetch reads within region, construct a matrix
+    '''
+    # get reads within region
+    reads_with_all_bases = set(base_to_reads[reg[0]])
+    for b in range(reg[0]+1, reg[1]+1):
+        reads_with_all_bases.intersection_update(base_to_reads[b])
+
+    read_metrics = []
+    for r in reads_with_all_bases:
+        r_metrics = read_to_metrics[r]
+        reg_mask = (r_metrics[MET_IDX_MAP['ref']] >= reg[0]) & \
+                (r_metrics[MET_IDX_MAP['ref']] <= reg[1])
+        read_metrics.append(r_metrics[MET_IDX_MAP[metric]][reg_mask])
+    return np.vstack(read_metrics)
+
+
+def gen_model_input(base_to_reads, read_to_metrics, ref_start, n_bases=3):
+    '''
+    Input: 
+        - base_to_reads: dict of base to read id mapping
+        - read_to_metrics: dict of read to base metrics mapping
+        - ref_start: start reference coord, 1-base
+        - n_bases: number of bases to infer
+    returns array of shape (n_reads, n_bases * 3)
+    '''
+    ref_start -= 1
+    all_reads = set()
+    for b in range(ref_start, ref_start+n_bases):
+        all_reads.update(base_to_reads[b])
+
+    mat = []
+    read_ids = []
+    for read in all_reads:
+        if read not in read_to_metrics:
+            continue
+        read_ids.append(read)
+        read_metrics = read_to_metrics[read]
+
+        mus = []
+        sigmas = []
+        ts = []
+        for b in range(ref_start, ref_start+n_bases):
+            if b not in read_metrics[0]:
+                mus.append(np.nan); sigmas.append(np.nan); ts.append(np.nan)
             else:
-                # subsampling
-                indices = torch.randperm(len(base_sig))[:len_dps]
-                base_sig = base_sig[indices]
-            sigs.append(base_sig)
-        sig_data_same_len.append(torch.hstack(sigs))
-    sig_data_same_len = torch.stack(sig_data_same_len)
-    return sig_data_same_len, median_dps, reads_in_window
+                base_mask = (read_metrics[0] == b)
+                mus.append(read_metrics[1][base_mask])
+                sigmas.append(read_metrics[2][base_mask])
+                ts.append(read_metrics[3][base_mask])
+        
+        read_vec = np.hstack([np.hstack(mus), np.hstack(sigmas), np.hstack(ts)])
+        mat.append(read_vec)
+
+    mat = np.vstack(mat)
+    mat[:, -3:] = np.log10(mat[:, -3:])
+    mat = torch.from_numpy(mat).float()
+
+    return mat, read_ids
