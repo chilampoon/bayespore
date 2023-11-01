@@ -1,166 +1,182 @@
 import pyro
 import torch
 import numpy as np
-from torch.distributions import constraints
 from pyro.infer import SVI, JitTraceEnum_ELBO, TraceEnum_ELBO, config_enumerate
 import pyro.distributions as dist
 import pyro.poutine as poutine
 from pyro.params import param_store
 from pyro.infer.autoguide.guides import AutoDelta
 from pyro.optim import Adam, ClippedAdam
-import pyro.contrib.gp as gp
-from scipy.special import logsumexp
-from scipy.stats import norm, invgamma
 import warnings
 warnings.filterwarnings("ignore", category=torch.jit.TracerWarning)
+from scipy.stats import norm, halfnorm
+
 
 @config_enumerate
-def gmm_simple(data, n_params=3, n_mod_status=2):
-    n_reads, n_bases = data.shape
-    n_bases = int(n_bases / n_params)
+def gmm_simple(data, ref_means=None, w_prior=None, w_prior_concent=1e-2, n_mod_status=2):
+    mean, std, dwell = data
+    n_reads, n_bases = mean.shape
 
-    is_observed = (~torch.isnan(data))
-    valid_data = torch.nan_to_num(data, nan=0.0)
+    mean_observed = (~torch.isnan(mean))
+    valid_mean = torch.nan_to_num(mean, nan=0.0)
+    std_observed = (~torch.isnan(std))
+    valid_std = torch.nan_to_num(std, nan=0.0)
+    dwell_observed = (~torch.isnan(dwell))
+    valid_dwell = torch.nan_to_num(dwell, nan=0.0)
 
-    # modification params:
-    with pyro.plate("mod", n_mod_status, dim=-2):
-        # weight for modified/unmodified
+    if w_prior is not None:
+        assert type(w_prior) == torch.Tensor
+        ω_concentration = w_prior_concent
         ω = pyro.sample(
             "ω",
-            dist.Gamma(1/n_mod_status, 1)
+            dist.Dirichlet(ω_concentration * w_prior)
         )
-        with pyro.plate("base", n_bases, dim=-1):
+    else:
+        # noninformative prior
+        ω = pyro.sample(
+            "ω",
+            dist.Dirichlet(1e-8 * torch.tensor([1 / n_mod_status] * n_mod_status))
+        )
+
+    # modification params:
+    if ref_means is None:
+        ref_means = torch.zeros(n_bases)
+    assert ref_means.shape == (n_bases,)
+
+    with pyro.plate("mod_status", n_mod_status, dim=-2):
+        with pyro.plate("base", n_bases, dim=-1) as b:
             # mean params
             μ_ν = pyro.sample(
                 "μ_ν",
-                dist.Normal(0, 5)
+                dist.Normal(loc=ref_means[b], scale=.1)
             )
-            μ_σ = pyro.sample(
-                "μ_σ",
+            μ_σ2 = pyro.sample(
+                "μ_σ2",
                 dist.InverseGamma(1, 1)
             )
-            # variance params
-            α = pyro.sample(
-                "α",
-                dist.Gamma(1, 1)
-            )         
-            β = pyro.sample(
-                "β",
-                dist.Gamma(1, 1)
+            # std params
+            τ_σ2 = pyro.sample(
+                "τ_σ2",
+                dist.InverseGamma(1, 1)
             )
             # dwell params
-            t_ν = pyro.sample(
-                "t_ν",
-                dist.Normal(0, 5)
+            δ_ν = pyro.sample(
+                "δ_ν",
+                dist.Normal(0, .1)
             )
-            t_σ = pyro.sample(
-                "t_σ",
+            δ_σ2 = pyro.sample(
+                "δ_σ2",
                 dist.InverseGamma(1, 1)
             )
-    
+
     # base params
     with pyro.plate("read_j", n_reads, dim=-2):
-        ω = ω.reshape(1, -1)[0]
         z = pyro.sample(
             "z",
             dist.Categorical(ω)
         )
-        with pyro.plate("base_i", n_bases, dim=-1) as i:
+
+        with pyro.plate("obs_i", n_bases, dim=-1) as i:
             pyro.sample(
                 "μ",
                 dist.Normal(
-                    μ_ν[z, i], 
-                    μ_σ[z, i]
-                ).mask(is_observed[:,0:n_bases]),
-                obs = valid_data[:,0:n_bases]
+                    loc=μ_ν[z, i], 
+                    scale=torch.sqrt(μ_σ2[z, i])
+                ).mask(mean_observed),
+                obs = valid_mean
             )
             pyro.sample(
                 "τ",
-                dist.InverseGamma(
-                    concentration=α[z, i], 
-                    rate=β[z, i]
-                ).mask(is_observed[:,n_bases:n_bases*2]),
-                obs = torch.clamp(valid_data[:, n_bases:n_bases*2], min=1e-8)
+                dist.HalfNormal(
+                    scale=torch.sqrt(τ_σ2[z, i])
+                ).mask(std_observed),
+                obs = valid_std
             )
             pyro.sample(
-                "t",
+                "δ",
                 dist.Normal(
-                    t_ν[z, i], 
-                    t_σ[z, i]
-                ).mask(is_observed[:,n_bases*2:n_bases*3]),
-                obs = valid_data[:,n_bases*2:n_bases*3]
+                    loc=δ_ν[z, i], 
+                    scale=torch.sqrt(δ_σ2[z, i])
+                ).mask(dwell_observed),
+                obs = valid_dwell
             )
-        
-#pyro.render_model(gmm_simple, model_args=(mat[:50,:],), render_distributions=True, render_params=True)              
+
+# tmp_data = (torch.from_numpy(trimmean[:50,:]), torch.from_numpy(trimsd[:50,:]), torch.from_numpy(dwell[:50,:]))
+# pyro.render_model(gmm_simple, model_args=(tmp_data,), render_distributions=True, render_params=True)   
 
 
-def run_svi(data, model=gmm_simple, n_mod_status=2, n_steps=2500):
+def run_svi(data, model, **kwargs):
     pyro.clear_param_store()
-    adam = ClippedAdam({'lr': 0.01, 
+    adam = ClippedAdam({'lr': kwargs.get('lr'),
                         'betas': [0.85, 0.99]})
-    guide = AutoDelta(poutine.block(gmm_simple, expose=['μ_ν', 'μ_σ', 'α', 'β','t_σ', 't_ν', 'ω']))
+    guide = AutoDelta(poutine.block(gmm_simple, expose=['ω', 'μ_ν', 'μ_σ2', 'τ_σ2', 'δ_σ2', 'δ_ν']))
     loss = JitTraceEnum_ELBO()
     svi = SVI(model, guide, adam, loss)
-    for _ in range(n_steps):
-        loss = svi.step(data=data, n_mod_status=n_mod_status)
+    for _ in range(kwargs.get('n_steps')):
+        loss = svi.step(
+            data=data, 
+            ref_means=kwargs.get('ref_means'), 
+            w_prior=kwargs.get('w_prior'),
+            w_prior_concent=kwargs.get('w_prior_concent'), 
+            n_mod_status=kwargs.get('n_mod_status'))
 
-    w = pyro.param("AutoDelta.ω").detach().numpy().reshape(1,-1)[0]
-    w = w / np.sum(w)
-    mu_mu = pyro.param("AutoDelta.μ_ν").detach().numpy()
-    mu_sigma = pyro.param("AutoDelta.μ_σ").detach().numpy()
-    alpha = pyro.param("AutoDelta.α").detach().numpy()
-    beta = pyro.param("AutoDelta.β").detach().numpy()
-    t_mu = pyro.param("AutoDelta.t_ν").detach().numpy()
-    t_sigma = pyro.param("AutoDelta.t_σ").detach().numpy()
-    return {'w': w, 'mu_mu':mu_mu, 'mu_sigma':mu_sigma, 'alpha':alpha, 
-            'beta':beta, 't_mu':t_mu, 't_sigma':t_sigma}
+    w = pyro.param("AutoDelta.ω").detach().numpy()
+    mu_loc = pyro.param("AutoDelta.μ_ν").detach().numpy()
+    mu_scale = np.sqrt(pyro.param("AutoDelta.μ_σ2").detach().numpy())
+    std_scale = np.sqrt(pyro.param("AutoDelta.τ_σ2").detach().numpy())
+    d_loc = pyro.param("AutoDelta.δ_ν").detach().numpy()
+    d_scale = np.sqrt(pyro.param("AutoDelta.δ_σ2").detach().numpy())
 
-
-def assign_ref_class(levels, ref_start, ref_end, mu_mu):
-    '''
-    set the component with less difference to reference levels as 0, the other as 1
-    '''
-    ref_levels = get_nbases_levels(levels, ref_start, ref_end)
-    assert len(ref_levels) == mu_mu.shape[1]
-    abs_diffs = [sum(np.abs(ref_levels - mu_c)) for mu_c in mu_mu]
-    indices = np.zeros_like(abs_diffs, dtype=int)
-    indices[np.argmax(abs_diffs)] = 1
-    return indices
+    return {'w': w, 'mu_loc':mu_loc, 'mu_scale':mu_scale, 
+            'd_loc':d_loc, 'd_scale':d_scale, 'tau_scale':std_scale}
 
 
-def compute_posteriors(data, n_bases, mu_mu, mu_sigma, alpha, beta, t_mu, t_sigma):
-    means = data[:, 0:n_bases]
-    variances = data[:, n_bases:n_bases*2]
-    dwells = data[:, n_bases*2:n_bases*3]
-    n_comps, _ = mu_mu.shape
+def compute_posteriors(data, params):
+    mean, sd, dwell = data
+    if type(mean) == torch.Tensor:
+        mean = mean.detach().numpy()
+        sd = sd.detach().numpy()
+        dwell = dwell.detach().numpy()
+    w = params.get('w')
+    mu_loc = params.get('mu_loc')
+    mu_scale = params.get('mu_scale')
+    d_loc = params.get('d_loc')
+    d_scale = params.get('d_scale')
+    tau_scale = params.get('tau_scale')
+
+    n_comps, n_bases = mu_loc.shape
     posteriors = []
     for z in range(n_comps):
         mu_base_sum = np.nansum(
             np.vstack([
-                norm.logpdf(means[:,b], loc=mu_mu[z,b], scale=mu_sigma[z,b]) 
+                norm.logpdf(
+                    mean[:,b], 
+                    loc=mu_loc[z,b], 
+                    scale=mu_scale[z,b]) 
                 for b in range(n_bases)
             ])
             , axis=0
         )
-        var_base_sum = np.nansum(
+        std_base_sum = np.nansum(
             np.vstack([
-                invgamma.logpdf(variances[:,b], a=alpha[z,b], scale=beta[z,b]) 
+                halfnorm.logpdf(sd[:,b], loc=0, scale=tau_scale[z,b])
                 for b in range(n_bases)
             ])
             , axis=0
         )
-        t_base_sum = np.nansum(
+        dwell_base_sum = np.nansum(
             np.vstack([
-                norm.logpdf(dwells[:,b], loc=t_mu[z,b], scale=t_sigma[z,b]) 
+                norm.logpdf(dwell[:,b], loc=d_loc[z,b], scale=d_scale[z,b]) 
                 for b in range(n_bases)
             ])
             , axis=0
         )
-        raw_post_base = np.sum([mu_base_sum, var_base_sum, t_base_sum], axis=0)
+        raw_post_base = np.sum([mu_base_sum, std_base_sum, dwell_base_sum], axis=0)
+        raw_post_base += np.log(w[z])
         posteriors.append(raw_post_base)
 
     posteriors = np.vstack(posteriors)
     probs = np.exp(posteriors - np.max(posteriors, axis=0, keepdims=True))
     total_probs = np.sum(probs, axis=0)
     norm_posteriors = probs / total_probs
-    return norm_posteriors
+    return np.vstack(norm_posteriors).T
