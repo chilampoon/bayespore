@@ -3,6 +3,7 @@
 from bayespore.inference import filter_inputs, assign_classes
 from bayespore.gmm import compute_posteriors
 import numpy as np
+import logging
 
 FORMAT = 'bedRModv1.6'
 ORG = 'IVT'
@@ -79,9 +80,9 @@ def parse_results(data, results, mod_type, contig, strand, read_out, site_out,
 
         try:
             mod_cluster, kickout, site_confidence, dists = assign_classes(mu_loc, ref_means)
-            print(kickout, ' kickout')
+            logging.debug(kickout, ' kickout')
         except Exception as e:
-            print(e)
+            logging.debug(e)
             continue
         
         # quick check

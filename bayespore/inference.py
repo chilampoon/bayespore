@@ -2,6 +2,7 @@ import torch
 from collections import defaultdict
 import numpy as np
 import os, gzip, pickle
+import logging
 from bayespore.gmm import run_svi, compute_posteriors
 
 from sklearn.cluster import KMeans
@@ -31,7 +32,7 @@ def iter_data(
 
     results = defaultdict(dict)
     for base in range(seq_region[0], seq_region[1], win_size+win_dist):
-        print(f'inferring {seq[base:base+win_size]} at {base}...')
+        logging.info(f'inferring {seq[base:base+win_size]} at {base}...')
         mean_win = trimmean[:,base:base+win_size]
         sd_win = trimsd[:,base:base+win_size]
         dwell_win = dwell_log10[:,base:base+win_size]
@@ -48,7 +49,7 @@ def iter_data(
         results[base]['reads_win'] = reads_win
         #print(f'ref means = {ref_means}')
     
-    with gzip.open(f'{out_dir}/metrics/params_{"_".join(seq_region)}.pkl.gz', 'wb') as p:
+    with gzip.open(f'{out_dir}/metrics/params_{"_".join(map(str, seq_region))}.pkl.gz', 'wb') as p:
         pickle.dump(results, p)
     return results
 
