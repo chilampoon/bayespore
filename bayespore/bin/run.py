@@ -87,10 +87,13 @@ def run_steps(**kwargs):
         kwargs.get('end'),
         kwargs.get('out_dir')
     )
-    read_ids, dwell, trimmean, trimsd, seq, levels = inputs
-
+    trimmean, trimsd, dwell, read_ids, seq, levels = inputs
+    
     w_prior = kwargs.get('weight_prior')
     w_prior = torch.Tensor(w_prior.split(','), type=torch.float32) if w_prior is not None else None
+
+    seq_region = kwargs.get('iter_region').split('-')
+    seq_region = tuple(map(int, seq_region))
 
     results = iter_data(
         trimmean,
@@ -99,7 +102,7 @@ def run_steps(**kwargs):
         read_ids,
         levels,
         seq,
-        kwargs.get('iter_region'),
+        seq_region,
         kwargs.get('win_size'),
         kwargs.get('win_dist'),
         gmm_simple,

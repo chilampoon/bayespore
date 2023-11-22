@@ -32,8 +32,29 @@ samtools fastq -T* 1a.basecall.bam | \
   samtools view -F 2324 -bS --no-PG - | samtools sort -@ 8 > 1a.bam
 samtools index -@ 8 1a.bam
 ```
-## Processing with remora API
-Download 5mer table from ONT:
+## Getting reference kmer levels
+Download direct RNA seq 5mer table from ONT:
 ```
 wget https://github.com/nanoporetech/kmer_models/raw/master/rna_r9.4_180mv_70bps/5mer_levels_v1.txt
 ```
+
+## Running
+this is another example:
+```
+sample=m6A_2
+bayespore run -b align/${sample}.bam \
+  -p pod5/${sample}.pod5 \
+  --kmer_table 5mer_levels_v1.txt \
+  --reverse_signal \
+  --contig reference \
+  --start 0 \
+  --end 1908 \
+  --iter_region 1-1901 \
+  --win_size 1 \
+  --middel_base_dist 0 \
+  --n_mod_status 3 \
+  --use_ref_levels \
+  --mod_type m6A \
+  -o ${sample}
+```
+

@@ -80,14 +80,14 @@ def assign_classes(mu_locs, ref_means, mu_weights=MU_WEIGHTS):
     
     # discard outlier
     dists0 = np.array([manhattan_dist(c, ref_means) for c in mu_locs])
-    furthest_idx = np.argmax(dists0)
-    idx_to_class = np.delete(np.arange(len(mu_locs)), furthest_idx)
-    mu_locs = mu_locs[idx_to_class]
-    kickout = np.array([furthest_idx])
+    mu_mask = np.array([i != np.argmax(dists0) for i in np.arange(len(mu_locs))])
+    idx_to_class = np.arange(len(mu_locs))[mu_mask]
+    kickout = np.arange(len(mu_locs))[~mu_mask]
+    mu_locs = mu_locs[mu_mask]
 
     # classify signal clusters
     weighted_mu_locs = mu_locs * mu_weights
-    kmeans = KMeans(n_clusters=2, n_init=21)
+    kmeans = KMeans(n_clusters = 2, n_init=21)
     kmeans.fit(weighted_mu_locs)
     cluster_ids = kmeans.labels_
     centroids = kmeans.cluster_centers_
@@ -100,6 +100,7 @@ def assign_classes(mu_locs, ref_means, mu_weights=MU_WEIGHTS):
 
     # assign classes
     furthest_cluster = np.argmax(dists)
-    mod_cluster = idx_to_class[cluster_ids == furthest_cluster]
-
+    mod_cluster_trimmed = np.arange(mu_locs.shape[0])[cluster_ids == furthest_cluster]
+    mod_cluster = np.array([idx_to_class[i] for i in mod_cluster_trimmed])
+    
     return mod_cluster, kickout, confidence_scores[furthest_cluster], dists
