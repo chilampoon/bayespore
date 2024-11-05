@@ -2,7 +2,7 @@
 
 A proof-of-concept Bayesian generative model aiming to de novo detect RNA modifications with ONT raw signals in single samples. Currently, it has been applied to one of the RMAP Challenge 2023 datasets.
 
-Update: our unsupervised model demonstrates decent accuracy in predicting modification positions and exhibits lower error rates in estimating modification frequencies compared to a supervised machine learning-based model([link](https://www.researchsquare.com/article/rs-5241143/v1))! We plan to further refine the model and publish our findings — stay tuned.
+Update: our unsupervised model won challenge 1! It demonstrates decent accuracy in predicting modification positions and exhibits lower error rates in estimating modification frequencies compared to a supervised machine learning-based model([link](https://www.researchsquare.com/article/rs-5241143/v1))! We plan to further refine the model and publish our findings — stay tuned.
 
 
 ### Installation
